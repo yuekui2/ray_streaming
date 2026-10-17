@@ -1,0 +1,42 @@
+=== [1/2] Running in-process gRPC unit test suite (test_image_manager_streaming) ===
+PASS: All in-process gRPC unit tests succeeded!
+
+=== [2/2] Running Live E2E Test for provider=nydus-dragonfly ===
+[nydus-dragonfly] can_provide(us-central1-docker.pkg.dev/kuiyue-gke-dev/kuiyue-gke-dev-repo/ate-images/sandbox-04176181c57f0bf23e61506b0ddcf1fd:nydus-v6) -> True
+[nydus-dragonfly] Cold pull_image completed in 440.5 ms -> /tmp/ray-images-nydus-dragonfly-rawho4pj/images/us-central1-docker.pkg.dev_kuiyue-gke-dev_kuiyue-gke-dev-repo_ate-images_sandbox-04176181c57f0bf23e61506b0ddcf1fd_nydus-v6
+[nydus-dragonfly] .streamed.json: {
+  "rootfs_dir": "/var/lib/ateom-gvisor/streaming/ray-e2e-nydus-dragonfly/us-central1-docker.pkg.dev_kuiyue-gke-dev_kuiyue-gke-dev-repo_ate-images_sandbox-04176181c57f0bf23e61506b0ddcf1fd_nydus-v6/rootfs",
+  "provider": "nydus-dragonfly",
+  "image_digest": "sha256:63efd7bfec93de795766e03c46b21496df0679548e46a37eb6291b3f5a9fff7c",
+  "image_ref": "us-central1-docker.pkg.dev/kuiyue-gke-dev/kuiyue-gke-dev-repo/ate-images/sandbox-04176181c57f0bf23e61506b0ddcf1fd:nydus-v6"
+}
+[nydus-dragonfly] rootfs_dir top-level entries (25): ['bin', 'boot', 'builder', 'dev', 'etc', 'home', 'ko-app', 'lib', 'lib32', 'lib64', 'libx32', 'media', 'mnt', 'opt', 'proc']
+[nydus-dragonfly] Backing mount for rootfs_dir: erofs /var/lib/ateom-gvisor/containerd-nydus/snapshots/21/mnt erofs ro,relatime,user_xattr,acl,cache_strategy=readaround,fsid=99737bbb3fb54b88420978f3c2b88b1ff7df5e848f1bfb06870ff4f8f057ce76 0 0
+[nydus-dragonfly] Warm pull_image completed in 3.36 ms
+[nydus-dragonfly] OCI Spec root={'path': '/var/lib/ateom-gvisor/streaming/ray-e2e-nydus-dragonfly/us-central1-docker.pkg.dev_kuiyue-gke-dev_kuiyue-gke-dev-repo_ate-images_sandbox-04176181c57f0bf23e61506b0ddcf1fd_nydus-v6/rootfs', 'readonly': False} annotations={'dev.gvisor.spec.rootfs.source': '/var/lib/ateom-gvisor/streaming/ray-e2e-nydus-dragonfly/us-central1-docker.pkg.dev_kuiyue-gke-dev_kuiyue-gke-dev-repo_ate-images_sandbox-04176181c57f0bf23e61506b0ddcf1fd_nydus-v6/rootfs', 'dev.gvisor.spec.rootfs.type': 'bind', 'dev.gvisor.spec.rootfs.overlay': 'memory', 'dev.gvisor.spec.rootfs.options': 'size=268435456'} cwd=/ env_count=2
+[nydus-dragonfly] Executing gVisor container on streamed rootfs: runsc --root=/tmp/runsc-ray-e2e-nydus-dragonfly --network=none --ignore-cgroups run --bundle /tmp/ray-images-nydus-dragonfly-rawho4pj/bundle ray-e2e-nydus-dragonfly-1792211255
+[nydus-dragonfly] runsc exit_code=0
+[nydus-dragonfly] runsc stdout:
+GVISOR_STREAMED_OK provider=nydus-dragonfly
+Linux runsc 4.19.0-gvisor #1 SMP Sun Jan 10 15:06:54 PST 2016 x86_64 x86_64 x86_64 GNU/Linux
+Filesystem      Size  Used Avail Use% Mounted on
+none            256M     0  256M   0% /
+-r-xr-xr-x 1 root root 9855748 Jan  1  1970 /ko-app/sandbox
+-rw-r--r-- 1 root root 0 Oct 17 04:27 /overlay_write_test
+[nydus-dragonfly] Verified lease release and rootfs_dir cleanup!
+--- [nydus-dragonfly] Adapter daemon logs ---
+2026/10/17 04:27:35 INFO Initialized cross-node Nydus + Dragonfly v2 (Kernel EROFS + fscache) OCILayerService driver dragonflyProxyAddr=http://127.0.0.1:65001 dragonflySchedulerAddr=10.96.1.32:8002 dragonflyManagerAddr=10.96.1.31:65003 verifyDragonflyPing=true procFilesystems=/proc/filesystems cachefilesDev=/dev/cachefiles
+2026/10/17 04:27:35 INFO OCILayerService adapter listening provider=nydus-dragonfly listenSocket=/run/ate-image-streaming/ocilayer-ray-e2e-nydus-dragonfly.sock snapshotterSocket=/run/containerd-nydus/containerd-nydus-grpc.sock
+2026/10/17 04:27:35 INFO Synchronized registry credentials to docker config path=/run/containerd-nydus/docker/config.json image=us-central1-docker.pkg.dev/kuiyue-gke-dev/kuiyue-gke-dev-repo/ate-images/sandbox-04176181c57f0bf23e61506b0ddcf1fd:nydus-v6 server=us-central1-docker.pkg.dev username=_token
+2026/10/17 04:27:35 INFO PrepareImage timing breakdown provider=nydus-dragonfly image=us-central1-docker.pkg.dev/kuiyue-gke-dev/kuiyue-gke-dev-repo/ate-images/sandbox-04176181c57f0bf23e61506b0ddcf1fd:nydus-v6 digest=sha256:63efd7bfec93de795766e03c46b21496df0679548e46a37eb6291b3f5a9fff7c layers=1 resolve_ms=332.341 stat_ms=1.856 prepare_ms=0 view_ms=1.457 listable_ms=0.026 wrapper_ms=0.242 total_ms=435.787
+2026/10/17 04:27:35 INFO Shutting down OCILayerService server socket=/run/ate-image-streaming/ocilayer-ray-e2e-nydus-dragonfly.sock
+
+=== Verified first run and bypass_ttl release; checking EROFS mount preservation and running second pass ===
+erofs /var/lib/ateom-gvisor/containerd-nydus/snapshots/21/mnt erofs ro,relatime,user_xattr,acl,cache_strategy=readaround,fsid=99737bbb3fb54b88420978f3c2b88b1ff7df5e848f1bfb06870ff4f8f057ce76 0 0
+
+=== [2/2] Running Live E2E Test for provider=nydus-dragonfly ===
+[nydus-dragonfly] can_provide(us-central1-docker.pkg.dev/kuiyue-gke-dev/kuiyue-gke-dev-repo/ate-images/sandbox-04176181c57f0bf23e61506b0ddcf1fd:nydus-v6) -> True
+[nydus-dragonfly] Cold pull_image completed in 387.2 ms -> /tmp/ray-images-nydus-dragonfly-aflu3aum/images/us-central1-docker.pkg.dev_kuiyue-gke-dev_kuiyue-gke-dev-repo_ate-images_sandbox-04176181c57f0bf23e61506b0ddcf1fd_nydus-v6
+[nydus-dragonfly] Warm pull_image completed in 3.70 ms
+[nydus-dragonfly] runsc exit_code=0
+[nydus-dragonfly] Verified lease release and rootfs_dir cleanup!

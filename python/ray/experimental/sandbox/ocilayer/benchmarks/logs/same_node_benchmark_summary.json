@@ -1,0 +1,35 @@
+[
+  {
+    "provider": "baseline-crane",
+    "image": "us-central1-docker.pkg.dev/kuiyue-gke-dev/kuiyue-gke-dev-repo/ate-images/sandbox-04176181c57f0bf23e61506b0ddcf1fd:benchmark-9layer",
+    "cold_pull_ms": 53910.0,
+    "cold_adapter_warm_snap_ms": null,
+    "warm_pull_ms": 0.31,
+    "bundle_ms": 8.1,
+    "runsc_ms": 46.4,
+    "total_cold_e2e_ms": 53964.5,
+    "disk_mb": 2872.4
+  },
+  {
+    "provider": "riptide",
+    "image": "us-central1-docker.pkg.dev/kuiyue-gke-dev/kuiyue-gke-dev-repo/ate-images/sandbox-04176181c57f0bf23e61506b0ddcf1fd:benchmark-9layer",
+    "cold_pull_ms": 1091.5,
+    "cold_adapter_warm_snap_ms": 16.7,
+    "warm_pull_ms": 3.94,
+    "bundle_ms": 9.4,
+    "runsc_ms": 345.5,
+    "total_cold_e2e_ms": 1446.5,
+    "disk_mb": 0.016
+  },
+  {
+    "provider": "nydus-dragonfly",
+    "image": "us-central1-docker.pkg.dev/kuiyue-gke-dev/kuiyue-gke-dev-repo/ate-images/sandbox-04176181c57f0bf23e61506b0ddcf1fd:nydus-v6",
+    "cold_pull_ms": 939.3,
+    "cold_adapter_warm_snap_ms": 6.8,
+    "warm_pull_ms": 4.13,
+    "bundle_ms": 10.0,
+    "runsc_ms": 5560.7,
+    "total_cold_e2e_ms": 6509.9,
+    "disk_mb": 0.016
+  }
+]

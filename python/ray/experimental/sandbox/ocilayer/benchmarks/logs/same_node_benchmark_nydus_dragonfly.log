@@ -1,0 +1,35 @@
+Refreshed docker config.json
+Started isolated containerd-nydus-grpc on /run/ate-image-streaming/nydus-bench-snapshotter.sock
+
+======================================================================
+[3/3] Benchmarking Streamed Nydus + Dragonfly v2 (Kernel EROFS + fscache)
+======================================================================
+[nydus-dragonfly] Cold pull_image: 939.3 ms (local disk=0.016 MiB)
+[nydus-dragonfly] OCI bundle=10.0 ms, runsc run=5560.7 ms, Total Cold E2E=6509.9 ms
+[nydus-dragonfly] Container output:
+BENCH_OK mode=nydus-dragonfly
+4.19.0-gvisor
+Python 3.10.12
+-r-xr-xr-x 1 root root 9.4M Jan  1  1970 /ko-app/sandbox
+[nydus-dragonfly] Warm lease pull_image (adapter cache hit): 4.13 ms
+[nydus-dragonfly] Cold adapter / warm snapshotter pull_image: 6.8 ms
+--- [nydus-dragonfly] Adapter Logs ---
+2026/10/17 21:14:04 INFO Initialized cross-node Nydus + Dragonfly v2 (Kernel EROFS + fscache) OCILayerService driver dragonflyProxyAddr=http://127.0.0.1:65001 dragonflySchedulerAddr=10.96.1.32:8002 dragonflyManagerAddr=10.96.1.31:65003 verifyDragonflyPing=true procFilesystems=/proc/filesystems cachefilesDev=/dev/cachefiles
+2026/10/17 21:14:04 INFO OCILayerService adapter listening provider=nydus-dragonfly listenSocket=/run/ate-image-streaming/ocilayer-bench-nydus.sock snapshotterSocket=/run/ate-image-streaming/nydus-bench-snapshotter.sock
+2026/10/17 21:14:04 INFO Synchronized registry credentials to docker config path=/run/containerd-nydus/docker/config.json image=us-central1-docker.pkg.dev/kuiyue-gke-dev/kuiyue-gke-dev-repo/ate-images/sandbox-04176181c57f0bf23e61506b0ddcf1fd:nydus-v6 server=us-central1-docker.pkg.dev username=_token
+2026/10/17 21:14:05 INFO Materialized and committed Nydus RAFS v6 EROFS bootstrap layer layerIndex=8 layerDigest=sha256:ba487201a54373ecc7dd03cbd402f32d1b887bc39c30992a58128e9b7bf35554 chainID=sha256:a5b54ba5e3b69630ae40d93a14d683bcb1939d0b74176a4e2f108ffe9601d5e8 targetDir=/var/lib/ateom-gvisor/nydus-bench/snapshots/9/fs dragonflyProxy=http://127.0.0.1:65001 dragonflyScheduler=10.96.1.32:8002 dragonflyManager=10.96.1.31:65003
+2026/10/17 21:14:05 INFO PrepareImage timing breakdown provider=nydus-dragonfly image=us-central1-docker.pkg.dev/kuiyue-gke-dev/kuiyue-gke-dev-repo/ate-images/sandbox-04176181c57f0bf23e61506b0ddcf1fd:nydus-v6 digest=sha256:63efd7bfec93de795766e03c46b21496df0679548e46a37eb6291b3f5a9fff7c layers=1 resolve_ms=303.488 stat_ms=2.863 prepare_ms=22.868 view_ms=32.087 listable_ms=0.033 wrapper_ms=0.22 total_ms=928.926
+2026/10/17 21:14:11 INFO Synchronized registry credentials to docker config path=/run/containerd-nydus/docker/config.json image=us-central1-docker.pkg.dev/kuiyue-gke-dev/kuiyue-gke-dev-repo/ate-images/sandbox-04176181c57f0bf23e61506b0ddcf1fd:nydus-v6 server=us-central1-docker.pkg.dev username=_token
+2026/10/17 21:14:11 INFO PrepareImage timing breakdown provider=nydus-dragonfly image=us-central1-docker.pkg.dev/kuiyue-gke-dev/kuiyue-gke-dev-repo/ate-images/sandbox-04176181c57f0bf23e61506b0ddcf1fd:nydus-v6 digest=sha256:63efd7bfec93de795766e03c46b21496df0679548e46a37eb6291b3f5a9fff7c layers=1 resolve_ms=0 stat_ms=1.295 prepare_ms=0 view_ms=1.064 listable_ms=0.023 wrapper_ms=0.199 total_ms=3.21
+2026/10/17 21:14:11 INFO Shutting down OCILayerService server socket=/run/ate-image-streaming/ocilayer-bench-nydus.sock
+NYDUS RESULT: {
+  "provider": "nydus-dragonfly",
+  "image": "us-central1-docker.pkg.dev/kuiyue-gke-dev/kuiyue-gke-dev-repo/ate-images/sandbox-04176181c57f0bf23e61506b0ddcf1fd:nydus-v6",
+  "cold_pull_ms": 939.3,
+  "cold_adapter_warm_snap_ms": 6.8,
+  "warm_pull_ms": 4.13,
+  "bundle_ms": 10.0,
+  "runsc_ms": 5560.7,
+  "total_cold_e2e_ms": 6509.9,
+  "disk_mb": 0.016
+}

@@ -1,0 +1,34 @@
+=== Same-Node Ray Sandbox Image Streaming Benchmark ===
+Node: gke-substrate-stream-c3-std22-ubuntu--5a335c0d-5h2p (Linux-6.8.0-1062-gke-x86_64-with-glibc2.39)
+
+======================================================================
+[1/3] Benchmarking Baseline Ray ImageManager (crane pull + tar extract)
+======================================================================
+[crane] Cold pull_image: 53910.0 ms (extracted disk=2872.4 MiB)
+[crane] Warm pull_image: 0.31 ms
+[crane] OCI bundle=8.1 ms, runsc run=46.4 ms, Total Cold E2E=53964.5 ms
+[crane] Container output:
+BENCH_OK mode=crane
+4.19.0-gvisor
+Python 3.10.12
+-r-xr-xr-x 1 root root 9.4M Jan  1  1970 /ko-app/sandbox
+
+======================================================================
+[2/3] Benchmarking Streamed Riptide (ocilayer-riptide + gcfsd-v2)
+======================================================================
+[riptide] Cold pull_image (cold snapshotter): 1091.5 ms (local disk=0.016 MiB)
+[riptide] OCI bundle=9.4 ms, runsc run=345.5 ms, Total Cold E2E=1446.5 ms
+[riptide] Container output:
+BENCH_OK mode=riptide
+4.19.0-gvisor
+Python 3.10.12
+-r-xr-xr-x 1 root root 9.4M Jan  1  1970 /ko-app/sandbox
+[riptide] Warm lease pull_image (adapter cache hit): 3.94 ms
+[riptide] Cold adapter / warm snapshotter pull_image: 16.7 ms
+--- [riptide] Adapter Logs ---
+2026/10/17 16:51:44 INFO OCILayerService adapter listening provider=riptide listenSocket=/run/ate-image-streaming/ocilayer-bench-riptide.sock snapshotterSocket=/run/ate-image-streaming/gcfs-snapshotter.sock
+2026/10/17 16:51:45 INFO Pushed registry credentials to gcfsd KeychainServiceSocket=/run/ate-image-streaming/gcfsd/keychain.sock image=us-central1-docker.pkg.dev/kuiyue-gke-dev/kuiyue-gke-dev-repo/ate-images/sandbox-04176181c57f0bf23e61506b0ddcf1fd:benchmark-9layer
+2026/10/17 16:51:46 INFO PrepareImage timing breakdown provider=riptide image=us-central1-docker.pkg.dev/kuiyue-gke-dev/kuiyue-gke-dev-repo/ate-images/sandbox-04176181c57f0bf23e61506b0ddcf1fd:benchmark-9layer digest=sha256:dfca0ecfbffdfc283118b35aa7e8c28a5fcba0c4fd7a8858b70c79bc6202e88a layers=9 resolve_ms=299.423 stat_ms=6.167 prepare_ms=744.527 view_ms=10.625 listable_ms=1.168 wrapper_ms=2.064 total_ms=1065.46
+2026/10/17 16:51:46 INFO Pushed registry credentials to gcfsd KeychainServiceSocket=/run/ate-image-streaming/gcfsd/keychain.sock image=us-central1-docker.pkg.dev/kuiyue-gke-dev/kuiyue-gke-dev-repo/ate-images/sandbox-04176181c57f0bf23e61506b0ddcf1fd:benchmark-9layer
+2026/10/17 16:51:46 INFO PrepareImage timing breakdown provider=riptide image=us-central1-docker.pkg.dev/kuiyue-gke-dev/kuiyue-gke-dev-repo/ate-images/sandbox-04176181c57f0bf23e61506b0ddcf1fd:benchmark-9layer digest=sha256:dfca0ecfbffdfc283118b35aa7e8c28a5fcba0c4fd7a8858b70c79bc6202e88a layers=9 resolve_ms=0 stat_ms=1.471 prepare_ms=0 view_ms=9.211 listable_ms=0.943 wrapper_ms=1.542 total_ms=13.599
+2026/10/17 16:51:46 INFO Shutting down OCILayerService server socket=/run/ate-image-streaming/ocilayer-bench-riptide.sock
