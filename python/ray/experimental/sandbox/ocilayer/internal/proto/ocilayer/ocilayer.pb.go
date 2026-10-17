@@ -288,7 +288,9 @@ type PrepareImageResponse struct {
 	// directories (bottom-most base layer first, matching OCI manifest order).
 	LayerDirs []string `protobuf:"bytes,3,rep,name=layer_dirs,json=layerDirs,proto3" json:"layer_dirs,omitempty"`
 	// provider_name identifies the adapter's streaming provider (e.g. "riptide", "soci").
-	ProviderName  string `protobuf:"bytes,4,opt,name=provider_name,json=providerName,proto3" json:"provider_name,omitempty"`
+	ProviderName string `protobuf:"bytes,4,opt,name=provider_name,json=providerName,proto3" json:"provider_name,omitempty"`
+	// rootfs_dir is the merged read-only root filesystem directory for the image.
+	RootfsDir     string `protobuf:"bytes,5,opt,name=rootfs_dir,json=rootfsDir,proto3" json:"rootfs_dir,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -347,6 +349,13 @@ func (x *PrepareImageResponse) GetLayerDirs() []string {
 func (x *PrepareImageResponse) GetProviderName() string {
 	if x != nil {
 		return x.ProviderName
+	}
+	return ""
+}
+
+func (x *PrepareImageResponse) GetRootfsDir() string {
+	if x != nil {
+		return x.RootfsDir
 	}
 	return ""
 }
@@ -611,14 +620,16 @@ const file_ocilayer_proto_rawDesc = "" +
 	"\rprovider_name\x18\x02 \x01(\tR\fproviderName\"k\n" +
 	"\x13PrepareImageRequest\x12\x1b\n" +
 	"\timage_ref\x18\x01 \x01(\tR\bimageRef\x127\n" +
-	"\x04auth\x18\x02 \x01(\v2#.substrate.ocilayer.v1.RegistryAuthR\x04auth\"\x9e\x01\n" +
+	"\x04auth\x18\x02 \x01(\v2#.substrate.ocilayer.v1.RegistryAuthR\x04auth\"\xbd\x01\n" +
 	"\x14PrepareImageResponse\x12!\n" +
 	"\fimage_digest\x18\x01 \x01(\tR\vimageDigest\x12\x1f\n" +
 	"\vconfig_json\x18\x02 \x01(\fR\n" +
 	"configJson\x12\x1d\n" +
 	"\n" +
 	"layer_dirs\x18\x03 \x03(\tR\tlayerDirs\x12#\n" +
-	"\rprovider_name\x18\x04 \x01(\tR\fproviderName\"Q\n" +
+	"\rprovider_name\x18\x04 \x01(\tR\fproviderName\x12\x1d\n" +
+	"\n" +
+	"rootfs_dir\x18\x05 \x01(\tR\trootfsDir\"Q\n" +
 	"\x13ReleaseImageRequest\x12\x1b\n" +
 	"\timage_ref\x18\x01 \x01(\tR\bimageRef\x12\x1d\n" +
 	"\n" +

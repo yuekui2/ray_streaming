@@ -1,4 +1,5 @@
 import copy
+import fcntl
 import json
 import logging
 import os
@@ -7,9 +8,12 @@ import tempfile
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, List, Optional, Union
 
+from ray.experimental.sandbox._internal import oci_layer_client
 from ray.experimental.sandbox._internal.image_utils import (
     DEFAULT_IMAGES_DIR,
     ROOTFS_IMAGE,
+    _USERS_SUBDIR,
+    _mark_image_in_use,
     _release_image_use,
     pull_and_extract_container_image,
     sanitize_image_name,
@@ -18,6 +22,9 @@ from ray.experimental.sandbox.config import DEFAULT_PUBLIC_DNS, parse_memory_byt
 from ray.experimental.sandbox.exceptions import SandboxCreationError
 
 logger = logging.getLogger(__name__)
+
+STREAMED_MARKER = ".streamed.json"
+_UNCLAIMED_USER_MARKER = ".unclaimed"
 
 # The OCI capability sets written when `capabilities` is given (schema:
 # https://github.com/opencontainers/runtime-spec/blob/main/config.md#linux-process).
@@ -241,6 +248,97 @@ class ImageManager(BaseImageManager):
         """Root directory for caching container images."""
         return self._images_dir
 
+    @staticmethod
+    def _is_local_archive_ref(image: str) -> bool:
+        return (
+            os.path.isfile(image)
+            or image.endswith(".tar")
+            or image.startswith(("/", "./", "../"))
+        )
+
+    @staticmethod
+    def _read_streamed_metadata(image_dir: str) -> Optional[Dict[str, Any]]:
+        streamed_path = os.path.join(image_dir, STREAMED_MARKER)
+        if not os.path.isfile(streamed_path):
+            return None
+        try:
+            with open(streamed_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else None
+        except Exception as err:
+            logger.warning(
+                "Failed to read streamed image metadata at '%s': %s",
+                streamed_path,
+                err,
+            )
+            return None
+
+    def _pull_streamed_image(
+        self,
+        image: str,
+        timeout_seconds: float,
+        instance_id: Optional[str],
+    ) -> str:
+        os.makedirs(self._images_dir, mode=0o777, exist_ok=True)
+        safe_name = sanitize_image_name(image)
+        image_dir = os.path.join(self._images_dir, safe_name)
+        lock_path = os.path.join(self._images_dir, f"{safe_name}.lock")
+
+        with open(lock_path, "w", encoding="utf-8") as f_lock:
+            try:
+                fcntl.flock(f_lock, fcntl.LOCK_EX)
+                meta = self._read_streamed_metadata(image_dir)
+                rootfs_valid = bool(
+                    meta
+                    and meta.get("rootfs_dir")
+                    and os.path.exists(meta["rootfs_dir"])
+                )
+                users_dir = os.path.join(image_dir, _USERS_SUBDIR)
+                unclaimed_marker = os.path.join(users_dir, _UNCLAIMED_USER_MARKER)
+
+                if instance_id is not None:
+                    user_marker = os.path.join(users_dir, instance_id)
+                    if rootfs_valid and os.path.exists(user_marker):
+                        return image_dir
+                    if rootfs_valid and os.path.exists(unclaimed_marker):
+                        try:
+                            os.replace(unclaimed_marker, user_marker)
+                            return image_dir
+                        except OSError:
+                            pass
+                else:
+                    if rootfs_valid:
+                        return image_dir
+
+                image_digest, config_dict, rootfs_dir, provider_name = (
+                    oci_layer_client.prepare_image(image, timeout=timeout_seconds)
+                )
+                os.makedirs(image_dir, mode=0o755, exist_ok=True)
+                config_path = os.path.join(image_dir, ".image_config.json")
+                with open(config_path, "w", encoding="utf-8") as f_cfg:
+                    json.dump(config_dict, f_cfg, indent=2)
+
+                streamed_meta = {
+                    "rootfs_dir": rootfs_dir,
+                    "provider": provider_name,
+                    "image_digest": image_digest,
+                    "image_ref": image,
+                }
+                streamed_path = os.path.join(image_dir, STREAMED_MARKER)
+                with open(streamed_path, "w", encoding="utf-8") as f_stream:
+                    json.dump(streamed_meta, f_stream, indent=2)
+
+                if instance_id is not None:
+                    _mark_image_in_use(image_dir, instance_id)
+                else:
+                    _mark_image_in_use(image_dir, _UNCLAIMED_USER_MARKER)
+                return image_dir
+            finally:
+                try:
+                    fcntl.flock(f_lock, fcntl.LOCK_UN)
+                except Exception:
+                    pass
+
     def pull_image(
         self,
         image: str,
@@ -260,6 +358,21 @@ class ImageManager(BaseImageManager):
         Returns:
             Absolute directory path containing the extracted container filesystem.
         """
+        if not self._is_local_archive_ref(image) and oci_layer_client.can_provide(
+            image
+        ):
+            try:
+                return self._pull_streamed_image(
+                    image,
+                    timeout_seconds=timeout_seconds,
+                    instance_id=instance_id,
+                )
+            except oci_layer_client.OCILayerNotSupportedError:
+                logger.info(
+                    "OCILayerService declined image '%s'; falling back to local pull and extract.",
+                    image,
+                )
+
         return pull_and_extract_container_image(
             image,
             images_dir=self._images_dir,
@@ -274,7 +387,48 @@ class ImageManager(BaseImageManager):
             image: Container image name or tar path passed to ``pull_image``.
             instance_id: The sandbox instance that no longer uses the image.
         """
-        _release_image_use(self.get_image_dir(image), instance_id)
+        image_dir = self.get_image_dir(image)
+        streamed_meta = self._read_streamed_metadata(image_dir)
+        if streamed_meta is None:
+            _release_image_use(image_dir, instance_id)
+            return
+
+        safe_name = sanitize_image_name(image)
+        lock_path = os.path.join(self._images_dir, f"{safe_name}.lock")
+        released_pin = False
+        try:
+            os.makedirs(self._images_dir, mode=0o777, exist_ok=True)
+            with open(lock_path, "w", encoding="utf-8") as f_lock:
+                try:
+                    fcntl.flock(f_lock, fcntl.LOCK_EX)
+                    users_dir = os.path.join(image_dir, _USERS_SUBDIR)
+                    user_marker = os.path.join(users_dir, instance_id)
+                    unclaimed_marker = os.path.join(
+                        users_dir, _UNCLAIMED_USER_MARKER
+                    )
+                    if os.path.exists(user_marker):
+                        try:
+                            os.remove(user_marker)
+                            released_pin = True
+                        except OSError:
+                            pass
+                    elif os.path.exists(unclaimed_marker):
+                        try:
+                            os.remove(unclaimed_marker)
+                            released_pin = True
+                        except OSError:
+                            pass
+                finally:
+                    try:
+                        fcntl.flock(f_lock, fcntl.LOCK_UN)
+                    except Exception:
+                        pass
+        except OSError:
+            _release_image_use(image_dir, instance_id)
+            released_pin = True
+
+        if released_pin:
+            oci_layer_client.release_image(image)
 
     def get_image_dir(self, image: str) -> str:
         """Get the cached local directory path for an image.
@@ -316,11 +470,14 @@ class ImageManager(BaseImageManager):
             image: Container image name or tar path.
 
         Returns:
-            True if image directory exists and contains .extracted marker.
+            True if image directory exists and contains .extracted or .streamed.json marker.
         """
         img_dir = self.get_image_dir(image)
         marker = os.path.join(img_dir, ".extracted")
-        return os.path.isdir(img_dir) and os.path.exists(marker)
+        streamed = os.path.join(img_dir, STREAMED_MARKER)
+        return os.path.isdir(img_dir) and (
+            os.path.exists(marker) or os.path.exists(streamed)
+        )
 
     def get_image_config(self, image: str) -> Dict[str, Any]:
         """Read and parse the image configuration JSON (.image_config.json) if available.
@@ -424,21 +581,36 @@ class ImageManager(BaseImageManager):
         )
 
         image_dir = self.pull_image(image)
-        erofs_image = os.path.join(image_dir, ROOTFS_IMAGE)
-        if not os.path.isfile(erofs_image):
-            raise SandboxCreationError(
-                f"Cached image '{image}' at {image_dir} has no {ROOTFS_IMAGE}; "
-                "the cache entry is incomplete. Delete it to pull again."
-            )
         spec.setdefault("root", {})
-        # gVisor mounts the EROFS image inside the Sentry; root.path is only
-        # the anchor under which the "self" overlay keeps the writable upper
-        # layer's backing file, so make it per sandbox.
-        rootfs = root_path or os.path.join(image_dir, "root")
-        os.makedirs(rootfs, exist_ok=True)
         annotations = spec.setdefault("annotations", {})
-        annotations["dev.gvisor.spec.rootfs.source"] = erofs_image
-        annotations["dev.gvisor.spec.rootfs.type"] = "erofs"
+
+        streamed_meta = self._read_streamed_metadata(image_dir)
+        if streamed_meta is not None:
+            rootfs = streamed_meta.get("rootfs_dir")
+            if not rootfs or not os.path.exists(rootfs):
+                raise SandboxCreationError(
+                    f"Streamed image '{image}' at {image_dir} has missing rootfs_dir "
+                    f"'{rootfs}'. Delete it to pull again."
+                )
+            annotations["dev.gvisor.spec.rootfs.source"] = rootfs
+            annotations["dev.gvisor.spec.rootfs.type"] = "bind"
+            overlay_medium = "memory"
+        else:
+            erofs_image = os.path.join(image_dir, ROOTFS_IMAGE)
+            if not os.path.isfile(erofs_image):
+                raise SandboxCreationError(
+                    f"Cached image '{image}' at {image_dir} has no {ROOTFS_IMAGE}; "
+                    "the cache entry is incomplete. Delete it to pull again."
+                )
+            # gVisor mounts the EROFS image inside the Sentry; root.path is only
+            # the anchor under which the "self" overlay keeps the writable upper
+            # layer's backing file, so make it per sandbox.
+            rootfs = root_path or os.path.join(image_dir, "root")
+            os.makedirs(rootfs, exist_ok=True)
+            annotations["dev.gvisor.spec.rootfs.source"] = erofs_image
+            annotations["dev.gvisor.spec.rootfs.type"] = "erofs"
+            overlay_medium = "self"
+
         # runsc applies no overlay to a read-only root, and an immutable image
         # can't grow a mount point for an arbitrary workdir, so a readonly
         # sandbox with an explicit workdir gets a private writable overlay
@@ -446,13 +618,13 @@ class ImageManager(BaseImageManager):
         if readonly and workdir_path is not None:
             logger.warning(
                 "readonly=True with an explicit workdir: runsc cannot create "
-                "the workdir mount point in a read-only EROFS image, so this "
+                "the workdir mount point in a read-only rootfs image, so this "
                 "sandbox runs on a private writable overlay (its writes are "
                 "discarded with it)."
             )
             readonly = False
         if not readonly:
-            annotations["dev.gvisor.spec.rootfs.overlay"] = "self"
+            annotations["dev.gvisor.spec.rootfs.overlay"] = overlay_medium
             disk_bytes = parse_memory_bytes(disk) or 0
             if disk_bytes > 0:
                 # gVisor sizes the overlay's upper layer from this annotation,

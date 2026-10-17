@@ -117,6 +117,7 @@ func (s *Server) PrepareImage(ctx context.Context, req *ocilayerpb.PrepareImageR
 		ConfigJson:   configJSON,
 		LayerDirs:    res.LayerDirs,
 		ProviderName: s.driver.Name(),
+		RootfsDir:    res.RootfsDir,
 	}, nil
 }
 

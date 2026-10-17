@@ -93,6 +93,11 @@ message PrepareImageResponse {
 
   // provider_name identifies the adapter's streaming provider (e.g. "riptide", "soci").
   string provider_name = 4;
+
+  // rootfs_dir is the merged read-only root filesystem directory for the image
+  // (<imageWorkDir>/rootfs), either a symlink to layer-0/fs for single-layer
+  // images or a read-only kernel overlayfs mount for multi-layer images.
+  string rootfs_dir = 5;
 }
 
 message ReleaseImageRequest {

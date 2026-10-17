@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +36,7 @@ import (
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/google"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -255,6 +257,7 @@ type imageLease struct {
 	snapshotKeys  []string
 	committedKeys []string
 	layers        []string
+	rootfsDir     string
 	workDir       string
 	refCount      int
 	idleTimer     *time.Timer
@@ -537,7 +540,7 @@ func (d *Driver) PrepareImage(ctx context.Context, req *ocilayer.PrepareRequest)
 			continue
 		}
 		if lease, ok := d.leases[req.ImageRef]; ok && !lease.evicted && lease.refCount >= 0 && lease.config != nil {
-			if layersExist(lease.layers) {
+			if layersExist(lease.layers) && rootfsDirExists(lease.rootfsDir) {
 				if lease.idleTimer != nil {
 					lease.idleTimer.Stop()
 					lease.idleTimer = nil
@@ -548,6 +551,7 @@ func (d *Driver) PrepareImage(ctx context.Context, req *ocilayer.PrepareRequest)
 					ImageDigest:  lease.digest,
 					Config:       &cfgCopy,
 					LayerDirs:    append([]string(nil), lease.layers...),
+					RootfsDir:    lease.rootfsDir,
 					ProviderName: d.name,
 				}
 				hook := d.warmHitHook
@@ -606,6 +610,110 @@ func layersExist(layers []string) bool {
 	return true
 }
 
+func rootfsDirExists(rootfsDir string) bool {
+	if rootfsDir == "" {
+		return false
+	}
+	_, err := os.Stat(rootfsDir)
+	return err == nil
+}
+
+func overlayLowerDirs(layerDirs []string) []string {
+	seen := make(map[string]struct{}, len(layerDirs))
+	lowerDirs := make([]string, 0, len(layerDirs))
+	for _, l := range slices.Backward(layerDirs) {
+		fsPath := filepath.Join(l, "fs")
+		if _, err := os.Lstat(fsPath); err != nil {
+			fsPath = l
+		}
+		dedupKey := fsPath
+		if resolved, err := filepath.EvalSymlinks(fsPath); err == nil {
+			dedupKey = resolved
+		}
+		if _, exists := seen[dedupKey]; exists {
+			continue
+		}
+		seen[dedupKey] = struct{}{}
+		lowerDirs = append(lowerDirs, fsPath)
+	}
+	return lowerDirs
+}
+
+func mountReadOnlyOverlay(rootfsDir string, lowerDirs []string) error {
+	fsfd, err := unix.Fsopen("overlay", unix.FSOPEN_CLOEXEC)
+	if err == nil {
+		defer func() { _ = unix.Close(fsfd) }()
+		lowerFailed := false
+		for _, lower := range lowerDirs {
+			if err := unix.FsconfigSetString(fsfd, "lowerdir+", lower); err != nil {
+				lowerFailed = true
+				break
+			}
+		}
+		if !lowerFailed {
+			if err := unix.FsconfigCreate(fsfd); err == nil {
+				mfd, err := unix.Fsmount(fsfd, unix.FSMOUNT_CLOEXEC, unix.MOUNT_ATTR_RDONLY)
+				if err == nil {
+					defer func() { _ = unix.Close(mfd) }()
+					if err := unix.MoveMount(mfd, "", unix.AT_FDCWD, rootfsDir, unix.MOVE_MOUNT_F_EMPTY_PATH); err == nil {
+						return nil
+					}
+				}
+			}
+		}
+	}
+	opts := "lowerdir=" + strings.Join(lowerDirs, ":")
+	return unix.Mount("overlay", rootfsDir, "overlay", unix.MS_RDONLY, opts)
+}
+
+func (d *Driver) prepareRootfsDir(imageWorkDir string, layerDirs []string) (string, error) {
+	rootfsDir := filepath.Join(imageWorkDir, "rootfs")
+	lowerDirs := overlayLowerDirs(layerDirs)
+	if len(lowerDirs) == 0 {
+		return "", errors.New("cannot prepare rootfs from 0 layer directories")
+	}
+
+	unmountRootfsDir(imageWorkDir)
+	_ = os.RemoveAll(rootfsDir)
+
+	if len(lowerDirs) == 1 {
+		if err := os.Symlink(lowerDirs[0], rootfsDir); err != nil {
+			return "", fmt.Errorf("symlinking single-layer rootfs %s -> %s: %w", rootfsDir, lowerDirs[0], err)
+		}
+		return rootfsDir, nil
+	}
+
+	if err := os.MkdirAll(rootfsDir, 0o755); err != nil {
+		return "", fmt.Errorf("creating rootfs mountpoint %s: %w", rootfsDir, err)
+	}
+	if err := mountReadOnlyOverlay(rootfsDir, lowerDirs); err != nil {
+		d.mu.Lock()
+		injected := d.clientInjected
+		d.mu.Unlock()
+		if injected && (errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) || errors.Is(err, unix.ENOSYS)) {
+			_ = os.RemoveAll(rootfsDir)
+			if symErr := os.Symlink(lowerDirs[0], rootfsDir); symErr != nil {
+				return "", fmt.Errorf("symlinking fallback rootfs %s -> %s: %w", rootfsDir, lowerDirs[0], symErr)
+			}
+			return rootfsDir, nil
+		}
+		return "", fmt.Errorf("mounting read-only overlayfs at %s: %w", rootfsDir, err)
+	}
+	return rootfsDir, nil
+}
+
+func unmountRootfsDir(workDir string) {
+	if workDir == "" {
+		return
+	}
+	rootfsDir := filepath.Join(workDir, "rootfs")
+	if fi, err := os.Lstat(rootfsDir); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		_ = os.Remove(rootfsDir)
+		return
+	}
+	_ = unix.Unmount(rootfsDir, unix.MNT_DETACH|unix.UMOUNT_NOFOLLOW)
+}
+
 func (d *Driver) prepareImageCold(ctx context.Context, req *ocilayer.PrepareRequest) (*ocilayer.PrepareResult, error) {
 	coldStart := time.Now()
 	client, err := d.getClient()
@@ -655,28 +763,39 @@ func (d *Driver) prepareImageCold(ctx context.Context, req *ocilayer.PrepareRequ
 		if lease.digest == "" {
 			lease.digest = digest
 		}
-		if d.resolvedMeta == nil {
-			d.resolvedMeta = make(map[string]*resolvedImageMeta)
+		if lease.workDir == "" && len(lease.layers) > 0 {
+			lease.workDir = filepath.Dir(lease.layers[0])
 		}
-		d.resolvedMeta[req.ImageRef] = &resolvedImageMeta{
-			digest:       lease.digest,
-			config:       lease.config,
-			diffIDs:      append([]string(nil), diffIDs...),
-			layerDigests: append([]string(nil), layerDigests...),
+		if !rootfsDirExists(lease.rootfsDir) && lease.workDir != "" {
+			if rDir, rErr := d.prepareRootfsDir(lease.workDir, lease.layers); rErr == nil {
+				lease.rootfsDir = rDir
+			}
 		}
-		lease.refCount++
-		cfgCopy := *lease.config
-		res := &ocilayer.PrepareResult{
-			ImageDigest:  lease.digest,
-			Config:       &cfgCopy,
-			LayerDirs:    append([]string(nil), lease.layers...),
-			ProviderName: d.name,
+		if rootfsDirExists(lease.rootfsDir) {
+			if d.resolvedMeta == nil {
+				d.resolvedMeta = make(map[string]*resolvedImageMeta)
+			}
+			d.resolvedMeta[req.ImageRef] = &resolvedImageMeta{
+				digest:       lease.digest,
+				config:       lease.config,
+				diffIDs:      append([]string(nil), diffIDs...),
+				layerDigests: append([]string(nil), layerDigests...),
+			}
+			lease.refCount++
+			cfgCopy := *lease.config
+			res := &ocilayer.PrepareResult{
+				ImageDigest:  lease.digest,
+				Config:       &cfgCopy,
+				LayerDirs:    append([]string(nil), lease.layers...),
+				RootfsDir:    lease.rootfsDir,
+				ProviderName: d.name,
+			}
+			d.mu.Unlock()
+			if warmHook != nil {
+				warmHook(ctx, criImageRef, req)
+			}
+			return res, nil
 		}
-		d.mu.Unlock()
-		if warmHook != nil {
-			warmHook(ctx, criImageRef, req)
-		}
-		return res, nil
 	}
 	d.mu.Unlock()
 
@@ -708,6 +827,7 @@ func (d *Driver) prepareImageCold(ctx context.Context, req *ocilayer.PrepareRequ
 
 	mounted, mountErr := d.layerMounter(ctx, env)
 	cleanupOnErr := func() {
+		unmountRootfsDir(imageWorkDir)
 		if d.workDirTeardownHook != nil {
 			d.workDirTeardownHook(imageWorkDir)
 		}
@@ -776,6 +896,14 @@ func (d *Driver) prepareImageCold(ctx context.Context, req *ocilayer.PrepareRequ
 		layerDirs = append(layerDirs, layerDir)
 	}
 
+	rootfsStart := time.Now()
+	rootfsDir, err := d.prepareRootfsDir(imageWorkDir, layerDirs)
+	if err != nil {
+		cleanupOnErr()
+		return nil, fmt.Errorf("preparing merged rootfs for %s: %w", req.ImageRef, err)
+	}
+	wrapperDur += time.Since(rootfsStart)
+
 	leaseWriteStart := time.Now()
 	if err := writeLeaseMetadata(imageWorkDir, &persistedLease{
 		ImageRef:     req.ImageRef,
@@ -785,6 +913,7 @@ func (d *Driver) prepareImageCold(ctx context.Context, req *ocilayer.PrepareRequ
 		LayerDigests: layerDigests,
 		SnapshotKeys: mounted.SnapshotKeys,
 		LayerDirs:    layerDirs,
+		RootfsDir:    rootfsDir,
 	}); err != nil {
 		cleanupOnErr()
 		return nil, fmt.Errorf("writing lease metadata: %w", err)
@@ -812,6 +941,7 @@ func (d *Driver) prepareImageCold(ctx context.Context, req *ocilayer.PrepareRequ
 		snapshotKeys:  mounted.SnapshotKeys,
 		committedKeys: mounted.CommittedKeys,
 		layers:        layerDirs,
+		rootfsDir:     rootfsDir,
 		workDir:       imageWorkDir,
 		refCount:      newRefCount,
 	}
@@ -854,6 +984,7 @@ func (d *Driver) prepareImageCold(ctx context.Context, req *ocilayer.PrepareRequ
 		ImageDigest:  digest,
 		Config:       &cfgCopy,
 		LayerDirs:    layerDirs,
+		RootfsDir:    rootfsDir,
 		ProviderName: d.name,
 	}, nil
 }
@@ -868,6 +999,7 @@ type persistedLease struct {
 	LayerDigests []string   `json:"layerDigests,omitempty"`
 	SnapshotKeys []string   `json:"snapshotKeys,omitempty"`
 	LayerDirs    []string   `json:"layerDirs,omitempty"`
+	RootfsDir    string     `json:"rootfsDir,omitempty"`
 }
 
 func writeLeaseMetadata(dir string, meta *persistedLease) error {
@@ -1018,6 +1150,7 @@ func (d *Driver) finishLeaseTeardown(ctx context.Context, imageRef string, lease
 		d.mu.Unlock()
 	}()
 
+	unmountRootfsDir(lease.workDir)
 	if lease.workDir != "" && d.workDirTeardownHook != nil {
 		d.workDirTeardownHook(lease.workDir)
 	}
@@ -1125,11 +1258,12 @@ func (d *Driver) ReconcileImages(ctx context.Context, active []*ocilayer.ActiveI
 			}
 		} else {
 			existing = &imageLease{
-				imageRef: key,
-				refCount: al.RefCount,
-				digest:   al.ImageDigest,
-				layers:   append([]string(nil), al.LayerDirs...),
-				workDir:  workDir,
+				imageRef:  key,
+				refCount:  al.RefCount,
+				digest:    al.ImageDigest,
+				layers:    append([]string(nil), al.LayerDirs...),
+				rootfsDir: filepath.Join(workDir, "rootfs"),
+				workDir:   workDir,
 			}
 			d.leases[key] = existing
 		}
@@ -1146,6 +1280,9 @@ func (d *Driver) ReconcileImages(ctx context.Context, active []*ocilayer.ActiveI
 			if len(existing.layers) == 0 && len(meta.LayerDirs) > 0 {
 				existing.layers = append([]string(nil), meta.LayerDirs...)
 			}
+			if existing.rootfsDir == "" && meta.RootfsDir != "" {
+				existing.rootfsDir = meta.RootfsDir
+			}
 			if len(meta.DiffIDs) > 0 {
 				if d.resolvedMeta == nil {
 					d.resolvedMeta = make(map[string]*resolvedImageMeta)
@@ -1157,6 +1294,9 @@ func (d *Driver) ReconcileImages(ctx context.Context, active []*ocilayer.ActiveI
 					layerDigests: append([]string(nil), meta.LayerDigests...),
 				}
 			}
+		}
+		if existing.rootfsDir == "" && existing.workDir != "" {
+			existing.rootfsDir = filepath.Join(existing.workDir, "rootfs")
 		}
 		if al.ImageDigest != "" && al.ImageDigest != key {
 			d.leases[al.ImageDigest] = existing
@@ -1224,6 +1364,7 @@ func (d *Driver) sweepOrphanWorkDirs(activeWorkDirs map[string]bool) {
 		if activeWorkDirs[dirPath] {
 			continue
 		}
+		unmountRootfsDir(dirPath)
 		if d.workDirTeardownHook != nil {
 			d.workDirTeardownHook(dirPath)
 		}

@@ -94,6 +94,9 @@ type PrepareResult struct {
 
 	// ProviderName is the underlying provider identifier reported by the adapter.
 	ProviderName string
+
+	// RootfsDir is the merged read-only root filesystem directory for the image.
+	RootfsDir string
 }
 
 // ReleaseRequest encapsulates the parameters for ReleaseImage.
@@ -281,6 +284,7 @@ func (c *GRPCClient) PrepareImage(ctx context.Context, req *PrepareRequest) (*Pr
 		Config:       cfg,
 		LayerDirs:    resp.GetLayerDirs(),
 		ProviderName: resp.GetProviderName(),
+		RootfsDir:    resp.GetRootfsDir(),
 	}, nil
 }
 

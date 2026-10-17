@@ -186,6 +186,12 @@ func TestServerAndDriverLifecycle(t *testing.T) {
 	if len(res1.LayerDirs) != 2 {
 		t.Fatalf("len(LayerDirs) = %d, want 2", len(res1.LayerDirs))
 	}
+	if res1.RootfsDir == "" {
+		t.Fatalf("res1.RootfsDir is empty")
+	}
+	if _, err := os.Stat(filepath.Join(res1.RootfsDir, "hello.txt")); err != nil {
+		t.Errorf("rootfsDir %q missing streamed file: %v", res1.RootfsDir, err)
+	}
 	for i, dir := range res1.LayerDirs {
 		if _, err := os.Stat(filepath.Join(dir, "fs", "hello.txt")); err != nil {
 			t.Errorf("layer %d missing streamed file: %v", i, err)
@@ -207,6 +213,9 @@ func TestServerAndDriverLifecycle(t *testing.T) {
 	snapClient.mu.Unlock()
 	if len(res2.LayerDirs) != 2 {
 		t.Fatalf("len(res2.LayerDirs) = %d, want 2", len(res2.LayerDirs))
+	}
+	if res2.RootfsDir != res1.RootfsDir {
+		t.Errorf("res2.RootfsDir = %q, want %q", res2.RootfsDir, res1.RootfsDir)
 	}
 
 	// 3. First ReleaseImage decrements refCount from 2 -> 1 (views stay mounted).
