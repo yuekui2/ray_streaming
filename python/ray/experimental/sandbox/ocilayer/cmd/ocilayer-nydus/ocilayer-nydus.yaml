@@ -1,0 +1,234 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Standalone OCILayerService Adapter DaemonSet for Nydus RAFS v6 + Dragonfly P2P
+# over Kernel EROFS + fscache (containerd-nydus-grpc + nydusd).
+#
+# Deployed onto nodes labeled ate.dev/oci-layer-service=nydus. Requires a Linux
+# kernel with CONFIG_EROFS_FS and CONFIG_CACHEFILES enabled (such as GKE
+# UBUNTU_CONTAINERD nodes) and runs as a privileged container to load the erofs
+# and cachefiles kernel modules and bind /dev/cachefiles.
+#
+# Userspace FUSE (fusedev) fallback is strictly disabled: if Kernel EROFS or
+# /dev/cachefiles is unavailable, both containers fail fast with an explicit
+# error to prevent accidental non-EROFS fallback.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ate-ocilayer-nydus-${SUBSTRATE_VERSION_SUFFIX}
+  namespace: ate-system
+  labels:
+    app: ate-ocilayer-adapter
+    ate.dev/oci-layer-provider: nydus
+    ate.dev/substrate-version: "${SUBSTRATE_VERSION}"
+spec:
+  selector:
+    matchLabels:
+      app: ate-ocilayer-adapter
+      ate.dev/oci-layer-provider: nydus
+      ate.dev/substrate-version: "${SUBSTRATE_VERSION}"
+  template:
+    metadata:
+      labels:
+        app: ate-ocilayer-adapter
+        ate.dev/oci-layer-provider: nydus
+        ate.dev/substrate-version: "${SUBSTRATE_VERSION}"
+    spec:
+      hostPID: true
+      hostNetwork: true
+      terminationGracePeriodSeconds: 5
+      nodeSelector:
+        ate.dev/substrate-version: "${SUBSTRATE_VERSION}"
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: ate.dev/oci-layer-service
+                operator: In
+                values:
+                - nydus
+                - disabled
+      tolerations:
+      - key: ate.dev/sandboxClass
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: nydus-snapshotter
+        image: debian:13-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
+        env:
+        - name: KUBE_HOME
+          value: /home/kubernetes
+        - name: NYDUS_VERSION
+          value: "2.3.0"
+        - name: NYDUS_SNAPSHOTTER_VERSION
+          value: "0.15.0"
+        - name: DRAGONFLY_PROXY_ADDR
+          value: "http://127.0.0.1:65001"
+        command:
+        - nsenter
+        - -t
+        - "1"
+        - -m
+        - -u
+        - -i
+        - -n
+        - --
+        - /bin/bash
+        - -ec
+        - |
+          readonly nydus_root="/var/lib/containerd-nydus"
+          readonly nydus_run="/run/containerd-nydus"
+          readonly nydusd_bin="${KUBE_HOME}/bin/nydusd"
+          readonly snapshotter_bin="${KUBE_HOME}/bin/containerd-nydus-grpc"
+          readonly df_addr="${DRAGONFLY_PROXY_ADDR:-http://127.0.0.1:65001}"
+
+          if [[ -f "${KUBE_HOME}/bin/modules/erofs.ko" && -f "${KUBE_HOME}/bin/modules/cachefiles.ko" ]]; then
+            modprobe netfs || true
+            modprobe zstd_decompress || true
+            modprobe zlib_inflate || true
+            if ! grep -q cachefiles_ondemand /proc/kallsyms 2>/dev/null; then
+              rmmod cachefiles 2>/dev/null || true
+              rmmod erofs 2>/dev/null || true
+              insmod "${KUBE_HOME}/bin/modules/erofs.ko" || true
+              insmod "${KUBE_HOME}/bin/modules/cachefiles.ko" || true
+            fi
+          else
+            modprobe erofs || true
+            modprobe cachefiles || true
+          fi
+
+          if ! grep -qw erofs /proc/filesystems; then
+            echo "FATAL: kernel EROFS is not registered in /proc/filesystems; fusedev fallback is disabled." >&2
+            exit 1
+          fi
+          if [[ ! -e /dev/cachefiles ]]; then
+            echo "FATAL: /dev/cachefiles is not available; fusedev fallback is disabled." >&2
+            exit 1
+          fi
+
+          mkdir -p "${KUBE_HOME}/bin" "${nydus_root}/cache/metadata" "${nydus_root}/mnt" "${nydus_run}/docker" /run/ate-image-streaming
+
+          if [[ ! -x "${nydusd_bin}" ]]; then
+            curl -fsSL "https://github.com/dragonflyoss/nydus/releases/download/v${NYDUS_VERSION}/nydus-static-v${NYDUS_VERSION}-linux-amd64.tgz" \
+              | tar -xz -C "${KUBE_HOME}/bin" --strip-components=1 nydus-static/nydusd nydus-static/nydus-image nydus-static/nydusify nydus-static/nydusctl
+            chmod +x "${KUBE_HOME}/bin/nydusd" "${KUBE_HOME}/bin/nydus-image" "${KUBE_HOME}/bin/nydusify" "${KUBE_HOME}/bin/nydusctl"
+          fi
+
+          if [[ ! -x "${snapshotter_bin}" ]]; then
+            curl -fsSL "https://github.com/containerd/nydus-snapshotter/releases/download/v${NYDUS_SNAPSHOTTER_VERSION}/nydus-snapshotter-v${NYDUS_SNAPSHOTTER_VERSION}-linux-amd64.tar.gz" \
+              | tar -xz -C "${KUBE_HOME}/bin" --strip-components=1 bin/containerd-nydus-grpc bin/nydus-overlayfs
+            chmod +x "${KUBE_HOME}/bin/containerd-nydus-grpc" "${KUBE_HOME}/bin/nydus-overlayfs"
+          fi
+
+          export PATH="${KUBE_HOME}/bin:${PATH}"
+          export DOCKER_CONFIG="${nydus_run}/docker"
+          if [[ ! -f "${DOCKER_CONFIG}/config.json" ]]; then
+            echo '{"auths":{}}' > "${DOCKER_CONFIG}/config.json"
+          fi
+
+          cat > "${nydus_root}/nydusd-config.json" <<EOF
+          {
+            "type": "bootstrap",
+            "config": {
+              "backend_type": "registry",
+              "backend_config": {
+                "scheme": "https",
+                "proxy": {
+                  "url": "${df_addr}",
+                  "ping_url": "${df_addr}/server/ping",
+                  "fallback": false,
+                  "check_interval": 5,
+                  "use_http": true
+                },
+                "timeout": 5,
+                "connect_timeout": 5,
+                "retry_limit": 2
+              },
+              "cache_type": "fscache",
+              "cache_config": {
+                "work_dir": "${nydus_root}/cache"
+              },
+              "metadata_path": "${nydus_root}/cache/metadata"
+            }
+          }
+          EOF
+
+          rm -f "${nydus_run}/containerd-nydus-grpc.sock"
+          exec "${snapshotter_bin}" \
+            --log-level=info \
+            --log-to-stdout \
+            --fs-driver=fscache \
+            --daemon-mode=shared \
+            --nydusd="${nydusd_bin}" \
+            --nydusd-config="${nydus_root}/nydusd-config.json" \
+            --address="${nydus_run}/containerd-nydus-grpc.sock" \
+            --root="${nydus_root}"
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: kube-home
+          mountPath: /home/kubernetes
+        - name: run-nydus
+          mountPath: /run/containerd-nydus
+        - name: var-lib-nydus
+          mountPath: /var/lib/containerd-nydus
+          mountPropagation: Bidirectional
+      - name: ocilayer-nydus
+        image: ko://github.com/agent-substrate/substrate/cmd/ocilayer-nydus
+        env:
+        - name: DRAGONFLY_PROXY_ADDR
+          value: "http://127.0.0.1:65001"
+        args:
+        - --listen-socket=/run/ate-image-streaming/ocilayer.sock
+        - --snapshotter-socket=/run/containerd-nydus/containerd-nydus-grpc.sock
+        - --docker-config=/run/containerd-nydus/docker/config.json
+        - --work-dir=/var/lib/ateom-gvisor/streaming/nydus
+        - --idle-ttl=10m
+        securityContext:
+          privileged: true
+          runAsUser: 0
+          runAsGroup: 0
+        volumeMounts:
+        - name: run-ate-image-streaming
+          mountPath: /run/ate-image-streaming
+        - name: run-ateom
+          mountPath: /var/lib/ateom-gvisor
+          mountPropagation: Bidirectional
+        - name: run-nydus
+          mountPath: /run/containerd-nydus
+        - name: var-lib-nydus
+          mountPath: /var/lib/containerd-nydus
+          mountPropagation: HostToContainer
+      volumes:
+      - name: kube-home
+        hostPath:
+          path: /home/kubernetes
+          type: Directory
+      - name: run-ate-image-streaming
+        hostPath:
+          path: /run/ate-image-streaming
+          type: DirectoryOrCreate
+      - name: run-ateom
+        hostPath:
+          path: /var/lib/ateom-gvisor
+          type: DirectoryOrCreate
+      - name: run-nydus
+        hostPath:
+          path: /run/containerd-nydus
+          type: DirectoryOrCreate
+      - name: var-lib-nydus
+        hostPath:
+          path: /var/lib/containerd-nydus
+          type: DirectoryOrCreate

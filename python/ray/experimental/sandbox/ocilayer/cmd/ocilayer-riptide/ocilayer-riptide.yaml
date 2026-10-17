@@ -1,0 +1,295 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Standalone OCILayerService Adapter DaemonSet for Google Riptide v2.
+#
+# Deployed onto nodes labeled ate.dev/oci-layer-service=riptide. Because the
+# FUSE daemon and snapshotter views must survive atelet rolling upgrades
+# (atelet-${SUBSTRATE_VERSION_SUFFIX}), the adapter and its dedicated Riptide
+# stack run in their own DaemonSet rather than as an atelet sidecar.
+#
+# Uses the preloaded GKE node binaries under /home/kubernetes/bin (installed by
+# install-riptide in configure.sh on every GKE worker node) and mirrors the
+# gke-setup-gcfs configuration in gke-internal-configure-helper.sh.
+#
+# Supports BOTH GKE node modes automatically:
+# 1. Node with GKE Image Streaming enabled (host gcfsd.service active):
+#    Runs an isolated gcfsd-v2 + containerd-gcfs-grpc pair in a child mount
+#    namespace where /run/gcfsd is privately bound to /run/ate-image-streaming/gcfsd
+#    and FUSE mounts under /var/lib/substrate/gcfs/mnt propagate bidirectionally
+#    to the host. This avoids both Snapshots.v1 BoltDB GC interference and
+#    gcfsd-v2 CreateView/DeleteView chainID collisions with host containerd.
+# 2. Node with GKE Image Streaming disabled (host gcfsd.service inactive):
+#    Runs the exact same isolated gcfsd-v2 + containerd-gcfs-grpc pair using the
+#    preloaded /home/kubernetes/bin binaries.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ate-ocilayer-riptide-${SUBSTRATE_VERSION_SUFFIX}
+  namespace: ate-system
+  labels:
+    app: ate-ocilayer-adapter
+    ate.dev/oci-layer-provider: riptide
+    ate.dev/substrate-version: "${SUBSTRATE_VERSION}"
+spec:
+  selector:
+    matchLabels:
+      app: ate-ocilayer-adapter
+      ate.dev/oci-layer-provider: riptide
+      ate.dev/substrate-version: "${SUBSTRATE_VERSION}"
+  template:
+    metadata:
+      labels:
+        app: ate-ocilayer-adapter
+        ate.dev/oci-layer-provider: riptide
+        ate.dev/substrate-version: "${SUBSTRATE_VERSION}"
+    spec:
+      hostPID: true
+      hostNetwork: true
+      terminationGracePeriodSeconds: 5
+      nodeSelector:
+        ate.dev/substrate-version: "${SUBSTRATE_VERSION}"
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: ate.dev/oci-layer-service
+                operator: In
+                values:
+                - riptide
+                - disabled
+      tolerations:
+      - key: ate.dev/sandboxClass
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: riptide-provider
+        image: debian:13-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
+        env:
+        - name: KUBE_HOME
+          value: /home/kubernetes
+        - name: ENABLE_GCFS_V2_API
+          value: "true"
+        - name: ENABLE_GCFS_LAYER_CACHING
+          value: "true"
+        - name: ENABLE_USERNAMESPACE_SUPPORT
+          value: "false"
+        command:
+        - nsenter
+        - -t
+        - "1"
+        - -m
+        - -u
+        - -i
+        - -n
+        - --
+        - /bin/bash
+        - -ec
+        - |
+          readonly gcfs_root="/var/lib/substrate/gcfs"
+          readonly gcfs_run_dir="/run/ate-image-streaming/gcfsd"
+          readonly gcfsd_mnt_dir="${gcfs_root}/mnt"
+
+          if systemctl is-active --quiet gcfsd.service; then
+            echo "Detected active host gcfsd.service (Mode 1: GKE Image Streaming enabled); starting isolated Substrate Riptide stack"
+          else
+            echo "No active host gcfsd.service detected (Mode 2: GKE Image Streaming disabled); starting isolated Substrate Riptide stack"
+          fi
+
+          for pid in $(pgrep -x containerd-gcfs || true) $(pgrep -x gcfsd-v2 || true); do
+            if tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -q "/var/lib/substrate/gcfs"; then
+              kill -9 "${pid}" 2>/dev/null || true
+            fi
+          done
+
+          umount -l "${gcfsd_mnt_dir}" 2>/dev/null || true
+          mkdir -p /run/ate-image-streaming "${gcfs_run_dir}" "${gcfs_root}" "${gcfsd_mnt_dir}" /run/gcfsd
+          rm -f "${gcfs_run_dir}/grpc.sock" "${gcfs_run_dir}/keychain.sock" "${gcfs_run_dir}/downloader.sock"
+
+          if ! mountpoint -q "${gcfs_root}"; then
+            mount --bind "${gcfs_root}" "${gcfs_root}"
+          fi
+          mount --make-rshared "${gcfs_root}"
+
+          exec unshare -m --propagation unchanged -- /bin/bash -ec '
+            readonly gcfs_root="/var/lib/substrate/gcfs"
+            readonly gcfsd_mnt_dir="${gcfs_root}/mnt"
+            readonly gcfs_socket_path="/run/gcfsd/grpc.sock"
+            readonly layer_cache_dir="${gcfs_root}/snapshotter/layers"
+            readonly images_in_use_db_path="${gcfs_root}/gcfsd/images_in_use.db"
+            readonly sentinel_file_path="${gcfs_root}/gcfsd_sentinel.txt"
+
+            mount --make-rslave /run
+            mount --bind /run/ate-image-streaming/gcfsd /run/gcfsd
+            mount --make-private /run/gcfsd
+
+            gcfs_cache_size_flag=""
+            if [[ -n "${GCFSD_CACHE_SIZE_MIB:-}" ]]; then
+              each_cache_size=$((GCFSD_CACHE_SIZE_MIB / 2))
+              gcfs_cache_size_flag="--max_content_cache_size_mb=${each_cache_size} --max_large_files_cache_size_mb=${each_cache_size}"
+            fi
+
+            gcfs_layer_caching_flag=""
+            if [[ "${ENABLE_GCFS_LAYER_CACHING:-false}" == "true" ]]; then
+              gcfs_layer_caching_flag="--layer_cache_dir=${layer_cache_dir}"
+            fi
+
+            client_version_flag=""
+            if [[ -n "${KUBELET_VERSION:-}" ]]; then
+              client_version_flag="--client_version=${KUBELET_VERSION}"
+            fi
+
+            gcfsd_bin="gcfsd"
+            enable_id_mapping_flag=""
+            if [[ "${ENABLE_GCFS_V2_API:-false}" == "true" ]]; then
+              gcfsd_bin="gcfsd-v2"
+              if [[ "${ENABLE_USERNAMESPACE_SUPPORT:-false}" == "true" ]]; then
+                enable_id_mapping_flag="--enable_id_mapping"
+              fi
+            fi
+
+            gcfs_read_ahead_flag="--enable_single_flighting=true --read_ahead_max_blocks=10 --read_ahead_cache_size_ratio=0.1"
+
+            if [[ -f "${KUBE_HOME}/gcfsd_application_default_credentials.json" ]]; then
+              export GCFSD_METRICS_ADC_CONFIG_PATH="${KUBE_HOME}/gcfsd_application_default_credentials.json"
+            fi
+
+            mkdir -p "${gcfsd_mnt_dir}" "${layer_cache_dir}" "$(dirname "${images_in_use_db_path}")"
+
+            gcfsd_pid=""
+            snapshotter_pid=""
+            cleanup() {
+              kill -TERM ${snapshotter_pid} ${gcfsd_pid} 2>/dev/null || true
+              wait ${snapshotter_pid} ${gcfsd_pid} 2>/dev/null || true
+              umount -l "${gcfsd_mnt_dir}" 2>/dev/null || true
+              rm -f /run/ate-image-streaming/gcfs-snapshotter.sock "${gcfs_socket_path}" /run/gcfsd/keychain.sock /run/gcfsd/downloader.sock
+            }
+            trap cleanup TERM INT EXIT
+
+            GOGC=10 "${KUBE_HOME}/bin/${gcfsd_bin}" \
+              --mount_point="${gcfsd_mnt_dir}" \
+              --control_server_socket_path="${gcfs_socket_path}" \
+              --downloader_uds_path=/run/gcfsd/downloader.sock \
+              --sentinel_file_path="${sentinel_file_path}" \
+              --containerd_uds_path="" \
+              --event_reporter_type=none \
+              --port=11254 \
+              ${gcfs_cache_size_flag} \
+              ${gcfs_layer_caching_flag} \
+              --images_in_use_db_path="${images_in_use_db_path}" \
+              ${enable_id_mapping_flag} \
+              --enable_pull_secret_keychain \
+              --client_name=GKE \
+              ${client_version_flag} \
+              ${gcfs_read_ahead_flag} &
+            gcfsd_pid=$!
+
+            for _ in $(seq 1 150); do
+              [[ -S "${gcfs_socket_path}" && -S /run/gcfsd/keychain.sock ]] && break
+              sleep 0.1
+            done
+
+            mkdir -p /etc/containerd-gcfs-grpc
+            touch "${gcfs_root}/config.toml"
+            export HOME=/root
+            if [[ -f "${KUBE_HOME}/gcfs_snaphotter_application_default_credentials.json" ]]; then
+              export GCFS_SNAPSHOTTER_METRICS_ADC_CONFIG_PATH="${KUBE_HOME}/gcfs_snaphotter_application_default_credentials.json"
+            fi
+
+            secondary_boot_disk_mount_points_flag=""
+            if [[ -n "${SECONDARY_BOOT_DISKS:-}" ]]; then
+              secondary_boot_disk_mount_points_flag="--secondary-disk-mount-points=${SECONDARY_BOOT_DISKS}"
+            fi
+            secondary_boot_data_disk_mount_points_flag=""
+            if [[ -n "${SECONDARY_BOOT_DATA_DISKS:-}" ]]; then
+              secondary_boot_data_disk_mount_points_flag="--secondary-data-disk-mount-points=${SECONDARY_BOOT_DATA_DISKS}"
+            fi
+
+            enable_v2_api_flag=""
+            if [[ "${ENABLE_GCFS_V2_API:-false}" == "true" ]]; then
+              enable_v2_api_flag="--enable-v2"
+            fi
+
+            rm -f /run/ate-image-streaming/gcfs-snapshotter.sock
+            "${KUBE_HOME}/bin/containerd-gcfs-grpc" \
+              --log-level=info \
+              --config="${gcfs_root}/config.toml" \
+              --address=/run/ate-image-streaming/gcfs-snapshotter.sock \
+              --root="${gcfs_root}" \
+              --gcfs-socket-path="${gcfs_socket_path}" \
+              --enable-kubernetes-event-reporting=false \
+              ${secondary_boot_disk_mount_points_flag} \
+              ${secondary_boot_data_disk_mount_points_flag} \
+              --disable-duplicate-layer-support=false \
+              --enable-metric-exporter=false \
+              ${enable_v2_api_flag} &
+            snapshotter_pid=$!
+            wait -n "${gcfsd_pid}" "${snapshotter_pid}"
+          '
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: kube-home
+          mountPath: /home/kubernetes
+          readOnly: true
+        - name: run-ate-image-streaming
+          mountPath: /run/ate-image-streaming
+        - name: substrate-gcfs-root
+          mountPath: /var/lib/substrate/gcfs
+          mountPropagation: Bidirectional
+        - name: dev-fuse
+          mountPath: /dev/fuse
+      - name: ocilayer-riptide
+        image: ko://github.com/agent-substrate/substrate/cmd/ocilayer-riptide
+        args:
+        - --listen-socket=/run/ate-image-streaming/ocilayer.sock
+        - --snapshotter-socket=/run/ate-image-streaming/gcfs-snapshotter.sock
+        - --keychain-socket=/run/ate-image-streaming/gcfsd/keychain.sock
+        - --work-dir=/var/lib/ateom-gvisor/streaming/riptide
+        - --idle-ttl=10m
+        securityContext:
+          privileged: true
+          runAsUser: 0
+          runAsGroup: 0
+        volumeMounts:
+        - name: run-ate-image-streaming
+          mountPath: /run/ate-image-streaming
+        - name: run-ateom
+          mountPath: /var/lib/ateom-gvisor
+        - name: substrate-gcfs-root
+          mountPath: /var/lib/substrate/gcfs
+          mountPropagation: HostToContainer
+      volumes:
+      - name: kube-home
+        hostPath:
+          path: /home/kubernetes
+          type: Directory
+      - name: run-ate-image-streaming
+        hostPath:
+          path: /run/ate-image-streaming
+          type: DirectoryOrCreate
+      - name: run-ateom
+        hostPath:
+          path: /var/lib/ateom-gvisor
+          type: DirectoryOrCreate
+      - name: substrate-gcfs-root
+        hostPath:
+          path: /var/lib/substrate/gcfs
+          type: DirectoryOrCreate
+      - name: dev-fuse
+        hostPath:
+          path: /dev/fuse
+          type: CharDevice
+

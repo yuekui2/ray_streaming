@@ -1,0 +1,186 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Standalone OCILayerService Adapter DaemonSet for AWS SOCI (soci-snapshotter-grpc).
+#
+# Deployed onto nodes labeled ate.dev/oci-layer-service=soci. Only one
+# OCILayerService Adapter DaemonSet runs on a given node at a time, listening
+# on the shared /run/ate-image-streaming/ocilayer.sock endpoint consumed by
+# atelet.
+#
+# Because the FUSE server (soci-snapshotter-grpc) runs inside this DaemonSet
+# and holds open /dev/fuse file descriptors for active ateom actor sandboxes,
+# its lifecycle is decoupled from atelet rolling upgrades.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ate-ocilayer-soci-${SUBSTRATE_VERSION_SUFFIX}
+  namespace: ate-system
+  labels:
+    app: ate-ocilayer-adapter
+    ate.dev/oci-layer-provider: soci
+    ate.dev/substrate-version: "${SUBSTRATE_VERSION}"
+spec:
+  selector:
+    matchLabels:
+      app: ate-ocilayer-adapter
+      ate.dev/oci-layer-provider: soci
+      ate.dev/substrate-version: "${SUBSTRATE_VERSION}"
+  template:
+    metadata:
+      labels:
+        app: ate-ocilayer-adapter
+        ate.dev/oci-layer-provider: soci
+        ate.dev/substrate-version: "${SUBSTRATE_VERSION}"
+    spec:
+      hostPID: true
+      hostNetwork: true
+      terminationGracePeriodSeconds: 5
+      nodeSelector:
+        ate.dev/substrate-version: "${SUBSTRATE_VERSION}"
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: ate.dev/oci-layer-service
+                operator: In
+                values:
+                - soci
+                - disabled
+      tolerations:
+      - key: ate.dev/sandboxClass
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: soci-snapshotter
+        image: debian:13-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
+        env:
+        - name: KUBE_HOME
+          value: /home/kubernetes
+        - name: SOCI_VERSION
+          value: "0.15.0"
+        - name: SOCI_MIN_LAYER_SIZE
+          value: "0"
+        command:
+        - nsenter
+        - -t
+        - "1"
+        - -m
+        - -u
+        - -i
+        - -n
+        - --
+        - /bin/bash
+        - -ec
+        - |
+          readonly soci_root="/var/lib/soci-snapshotter-grpc"
+          readonly soci_run="/run/soci-snapshotter-grpc"
+          readonly soci_bin="${KUBE_HOME}/bin/soci-snapshotter-grpc"
+
+          mkdir -p "${KUBE_HOME}/bin" "${soci_root}" "${soci_run}/bin" "${soci_run}/docker" /run/ate-image-streaming
+
+          if [[ ! -x "${soci_bin}" ]]; then
+            echo "Installing soci-snapshotter-grpc v${SOCI_VERSION} into ${KUBE_HOME}/bin..."
+            curl -fsSL "https://github.com/awslabs/soci-snapshotter/releases/download/v${SOCI_VERSION}/soci-snapshotter-${SOCI_VERSION}-linux-amd64.tar.gz" \
+              | tar -xz -C "${KUBE_HOME}/bin" soci-snapshotter-grpc soci
+            chmod +x "${KUBE_HOME}/bin/soci-snapshotter-grpc" "${KUBE_HOME}/bin/soci"
+          fi
+
+          if [[ -x /usr/bin/fusermount && ! -x "${soci_run}/bin/fusermount3" ]]; then
+            ln -sf /usr/bin/fusermount "${soci_run}/bin/fusermount3"
+          fi
+          export PATH="${soci_run}/bin:${KUBE_HOME}/bin:${PATH}"
+          export DOCKER_CONFIG="${soci_run}/docker"
+
+          if [[ ! -f "${DOCKER_CONFIG}/config.json" ]]; then
+            echo '{"auths":{}}' > "${DOCKER_CONFIG}/config.json"
+          fi
+
+          cat > "${soci_root}/config.toml" <<EOF
+          [pull_modes]
+            [pull_modes.soci_v1]
+              enable = true
+            [pull_modes.soci_v2]
+              enable = true
+
+          [snapshotter]
+            min_layer_size = ${SOCI_MIN_LAYER_SIZE:-0}
+          EOF
+
+          rm -f "${soci_run}/soci-snapshotter-grpc.sock"
+          exec "${soci_bin}" \
+            --log-level=info \
+            --config="${soci_root}/config.toml" \
+            --address="${soci_run}/soci-snapshotter-grpc.sock" \
+            --root="${soci_root}"
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: kube-home
+          mountPath: /home/kubernetes
+        - name: run-soci
+          mountPath: /run/soci-snapshotter-grpc
+        - name: var-lib-soci
+          mountPath: /var/lib/soci-snapshotter-grpc
+          mountPropagation: Bidirectional
+        - name: dev-fuse
+          mountPath: /dev/fuse
+      - name: ocilayer-soci
+        image: ko://github.com/agent-substrate/substrate/cmd/ocilayer-soci
+        args:
+        - --listen-socket=/run/ate-image-streaming/ocilayer.sock
+        - --snapshotter-socket=/run/soci-snapshotter-grpc/soci-snapshotter-grpc.sock
+        - --docker-config=/run/soci-snapshotter-grpc/docker/config.json
+        - --work-dir=/var/lib/ateom-gvisor/streaming/soci
+        - --idle-ttl=10m
+        securityContext:
+          privileged: true
+          runAsUser: 0
+          runAsGroup: 0
+        volumeMounts:
+        - name: run-ate-image-streaming
+          mountPath: /run/ate-image-streaming
+        - name: run-ateom
+          mountPath: /var/lib/ateom-gvisor
+        - name: run-soci
+          mountPath: /run/soci-snapshotter-grpc
+        - name: var-lib-soci
+          mountPath: /var/lib/soci-snapshotter-grpc
+          mountPropagation: HostToContainer
+      volumes:
+      - name: kube-home
+        hostPath:
+          path: /home/kubernetes
+          type: Directory
+      - name: run-ate-image-streaming
+        hostPath:
+          path: /run/ate-image-streaming
+          type: DirectoryOrCreate
+      - name: run-ateom
+        hostPath:
+          path: /var/lib/ateom-gvisor
+          type: DirectoryOrCreate
+      - name: run-soci
+        hostPath:
+          path: /run/soci-snapshotter-grpc
+          type: DirectoryOrCreate
+      - name: var-lib-soci
+        hostPath:
+          path: /var/lib/soci-snapshotter-grpc
+          type: DirectoryOrCreate
+      - name: dev-fuse
+        hostPath:
+          path: /dev/fuse
+          type: CharDevice

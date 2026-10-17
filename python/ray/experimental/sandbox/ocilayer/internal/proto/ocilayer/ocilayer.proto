@@ -1,0 +1,120 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package substrate.ocilayer.v1;
+
+option go_package = "github.com/agent-substrate/substrate/internal/proto/ocilayer;ocilayer";
+
+// OCILayerService is Substrate's uniform node-local gRPC interface implemented
+// by out-of-process image-streaming adapters (such as the Riptide v2 and AWS
+// SOCI Adapter DaemonSets).
+//
+// Given an OCI image reference and resolved registry credentials, the service
+// prepares and mounts the image's layers on the host (under a per-image
+// contract) and returns their ordered read-only directory paths for overlayfs
+// lowerdir composition.
+service OCILayerService {
+  // CanProvide checks whether the adapter and underlying streaming provider are
+  // healthy and able to serve the given OCI image.
+  rpc CanProvide(CanProvideRequest) returns (CanProvideResponse);
+
+  // PrepareImage resolves and mounts the layers for the OCI image, increments
+  // the per-image/per-layer reference count (refCount), and returns the
+  // complete ordered list of read-only host LayerDirs.
+  //
+  // If the image cannot be served by the provider, PrepareImage returns
+  // codes.FailedPrecondition so atelet can fall back to local imagecache for
+  // the entire image.
+  rpc PrepareImage(PrepareImageRequest) returns (PrepareImageResponse);
+
+  // ReleaseImage decrements the reference count (refCount) for the image's
+  // layers when an actor checkpoints or terminates, unmounting unused layer
+  // views once refCount reaches 0 (subject to the adapter's idle TTL unless
+  // bypass_ttl is set).
+  rpc ReleaseImage(ReleaseImageRequest) returns (ReleaseImageResponse);
+
+  // ReconcileImages is called by atelet on startup/restart with the active
+  // streamed images discovered from surviving on-disk actor bundles
+  // (rootfs-overlay.json), allowing the adapter to rebuild accurate in-memory
+  // refCounts and unmount orphaned FUSE views after an atelet crash.
+  rpc ReconcileImages(ReconcileImagesRequest) returns (ReconcileImagesResponse);
+}
+
+// RegistryAuth carries resolved registry credentials (from the Kubelet
+// Credential Provider or workload imagePullSecrets) for one image request.
+message RegistryAuth {
+  string username = 1;
+  string password = 2;
+  string auth = 3;
+  string server_address = 4;
+  string identity_token = 5;
+  string registry_token = 6;
+}
+
+message CanProvideRequest {
+  string image_ref = 1;
+  RegistryAuth auth = 2;
+}
+
+message CanProvideResponse {
+  bool can_provide = 1;
+  string provider_name = 2;
+}
+
+message PrepareImageRequest {
+  string image_ref = 1;
+  RegistryAuth auth = 2;
+}
+
+message PrepareImageResponse {
+  // image_digest is the resolved OCI manifest digest ("sha256:<hex>").
+  string image_digest = 1;
+
+  // config_json is the JSON-encoded OCI v1.Config (entrypoint, cmd, env, user,
+  // working_dir) for the resolved image.
+  bytes config_json = 2;
+
+  // layer_dirs contains the complete ordered list of read-only host layer
+  // directories (bottom-most base layer first, matching OCI manifest order).
+  repeated string layer_dirs = 3;
+
+  // provider_name identifies the adapter's streaming provider (e.g. "riptide", "soci").
+  string provider_name = 4;
+}
+
+message ReleaseImageRequest {
+  string image_ref = 1;
+
+  // bypass_ttl instructs the adapter to unmount layers immediately when
+  // refCount drops to 0 rather than holding them for the idle retention TTL
+  // (used when draining streamed layers after ate.dev/oci-layer-service=disabled).
+  bool bypass_ttl = 2;
+}
+
+message ReleaseImageResponse {}
+
+message ActiveImageLayers {
+  string image_ref = 1;
+  string image_digest = 2;
+  repeated string layer_dirs = 3;
+  int32 ref_count = 4;
+}
+
+message ReconcileImagesRequest {
+  repeated ActiveImageLayers active_images = 1;
+}
+
+message ReconcileImagesResponse {}
